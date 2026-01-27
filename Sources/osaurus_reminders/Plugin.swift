@@ -573,8 +573,12 @@ private var api: osr_plugin_api = {
     let manifest = """
       {
         "plugin_id": "osaurus.reminders",
-        "version": "0.1.0",
+        "name": "Reminders",
         "description": "An Osaurus plugin for interacting with macOS Reminders via EventKit.",
+        "license": "MIT",
+        "authors": ["Osaurus"],
+        "min_macos": "13.0",
+        "min_osaurus": "0.5.0",
         "capabilities": {
           "tools": [\(toolsJson)]
         }
