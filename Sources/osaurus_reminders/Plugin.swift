@@ -128,17 +128,21 @@ protocol Tool {
   var parameters: String { get }
   var requirements: [String] { get }
   var permissionPolicy: String { get }
+  /// opt-in flag: when true, this tool appears in the dashboard's add-widget picker
+  var widget: Bool { get }
   func run(args: String) -> String
 }
 
 extension Tool {
   var requirements: [String] { [] }
   var permissionPolicy: String { "ask" }
+  var widget: Bool { false }
 }
 
 // 1. Get Reminders
 struct GetRemindersTool: Tool {
   let name = "get_reminders"
+  let widget = true
   let description = "Get reminders, optionally filtering by list, status, or date range."
   let requirements = ["reminders"]
   let parameters = """
@@ -416,6 +420,7 @@ struct CreateReminderTool: Tool {
 // 4. Get Lists
 struct GetListsTool: Tool {
   let name = "get_lists"
+  let widget = true
   let description = "Get all reminder lists."
   let requirements = ["reminders"]
   let parameters = "{ \"type\": \"object\", \"properties\": {} }"
@@ -559,9 +564,11 @@ private var api: osr_plugin_api = {
     // Build JSON manifest dynamically
     let toolsJson = ctx.tools.values.map { tool in
       let reqs = tool.requirements.map { "\"\($0)\"" }.joined(separator: ",")
+      let widgetField = tool.widget ? "\"widget\": true," : ""
       return """
         {
             "id": "\(tool.name)",
+            \(widgetField)
             "description": "\(tool.description)",
             "parameters": \(tool.parameters),
             "requirements": [\(reqs)],
