@@ -2,6 +2,25 @@ import AppKit
 import EventKit
 import Foundation
 
+// MARK: - Helpers
+
+/// Escapes a string for safe interpolation inside an AppleScript double-quoted literal.
+func escapeAppleScriptString(_ s: String) -> String {
+  var out = ""
+  out.reserveCapacity(s.count + 2)
+  for ch in s {
+    switch ch {
+    case "\\": out += "\\\\"
+    case "\"": out += "\\\""
+    case "\n": out += "\\n"
+    case "\r": out += "\\r"
+    case "\t": out += "\\t"
+    default: out.append(ch)
+    }
+  }
+  return out
+}
+
 // MARK: - Models
 
 struct ReminderDTO: Encodable {
@@ -160,7 +179,9 @@ struct GetRemindersTool: Tool {
 
   func run(args: String) -> String {
     guard ReminderManager.shared.ensureAccess() else {
-      return "{\"error\": \"Access to Reminders denied. Please enable in System Settings.\"}"
+      return Envelope.failure(
+        .unavailable, "Access to Reminders denied. Please enable in System Settings.",
+        retryable: false)
     }
 
     struct Args: Decodable {
@@ -173,18 +194,21 @@ struct GetRemindersTool: Tool {
 
     guard let data = args.data(using: .utf8),
       let input = try? JSONDecoder().decode(Args.self, from: data)
-    else { return "{\"error\": \"Invalid arguments\"}" }
+    else { return Envelope.failure(.invalidArgs, "Invalid arguments") }
 
     let store = ReminderManager.shared.store
     var calendars: [EKCalendar]? = nil
 
     if let listName = input.listName {
+      guard !listName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        return Envelope.failure(.invalidArgs, "listName must not be empty.")
+      }
       let all = ReminderManager.shared.getLists()
       if let match = all.first(where: { $0.title.caseInsensitiveCompare(listName) == .orderedSame })
       {
         calendars = [match]
       } else {
-        return "{\"error\": \"List '\(listName)' not found.\"}"
+        return Envelope.failure(.notFound, "List '\(listName)' not found.")
       }
     }
 
@@ -243,7 +267,7 @@ struct GetRemindersTool: Tool {
 
       let dtos = limited.map { ReminderDTO(from: $0) }
       guard let json = try? JSONEncoder().encode(dtos) else {
-        return "{\"error\": \"Encoding failed\"}"
+        return Envelope.failure(.executionError, "Encoding failed")
       }
       return String(data: json, encoding: .utf8) ?? "{}"
     }
@@ -263,7 +287,7 @@ struct GetRemindersTool: Tool {
 
     let dtos = limited.map { ReminderDTO(from: $0) }
     guard let json = try? JSONEncoder().encode(dtos) else {
-      return "{\"error\": \"Encoding failed\"}"
+      return Envelope.failure(.executionError, "Encoding failed")
     }
     return String(data: json, encoding: .utf8) ?? "{}"
   }
@@ -287,7 +311,7 @@ struct SearchRemindersTool: Tool {
 
   func run(args: String) -> String {
     guard ReminderManager.shared.ensureAccess() else {
-      return "{\"error\": \"Access denied\"}"
+      return Envelope.failure(.unavailable, "Access to Reminders denied.", retryable: false)
     }
 
     struct Args: Decodable {
@@ -297,7 +321,7 @@ struct SearchRemindersTool: Tool {
     guard let data = args.data(using: .utf8),
       let input = try? JSONDecoder().decode(Args.self, from: data)
     else {
-      return "{\"error\": \"Invalid args\"}"
+      return Envelope.failure(.invalidArgs, "Invalid arguments")
     }
 
     // We fetch all incomplete (and maybe recent completed?) and filter in memory since
@@ -326,7 +350,7 @@ struct SearchRemindersTool: Tool {
 
     let dtos = limited.map { ReminderDTO(from: $0) }
     guard let json = try? JSONEncoder().encode(dtos) else {
-      return "{\"error\": \"Encoding failed\"}"
+      return Envelope.failure(.executionError, "Encoding failed")
     }
     return String(data: json, encoding: .utf8) ?? "{}"
   }
@@ -353,7 +377,7 @@ struct CreateReminderTool: Tool {
 
   func run(args: String) -> String {
     guard ReminderManager.shared.ensureAccess() else {
-      return "{\"error\": \"Access denied\"}"
+      return Envelope.failure(.unavailable, "Access to Reminders denied.", retryable: false)
     }
 
     struct Args: Decodable {
@@ -367,7 +391,11 @@ struct CreateReminderTool: Tool {
     guard let data = args.data(using: .utf8),
       let input = try? JSONDecoder().decode(Args.self, from: data)
     else {
-      return "{\"error\": \"Invalid args\"}"
+      return Envelope.failure(.invalidArgs, "Invalid arguments")
+    }
+
+    guard !input.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+      return Envelope.failure(.invalidArgs, "title must not be empty.")
     }
 
     let store = ReminderManager.shared.store
@@ -382,12 +410,15 @@ struct CreateReminderTool: Tool {
 
     // Handle List
     if let listName = input.listName {
+      guard !listName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        return Envelope.failure(.invalidArgs, "listName must not be empty.")
+      }
       if let list = ReminderManager.shared.getLists().first(where: {
         $0.title.caseInsensitiveCompare(listName) == .orderedSame
       }) {
         reminder.calendar = list
       } else {
-        return "{\"error\": \"List '\(listName)' not found\"}"
+        return Envelope.failure(.notFound, "List '\(listName)' not found.")
       }
     } else {
       reminder.calendar = store.defaultCalendarForNewReminders()
@@ -412,7 +443,8 @@ struct CreateReminderTool: Tool {
       return
         "{\"success\": true, \"id\": \"\(reminder.calendarItemIdentifier)\", \"message\": \"Reminder created\"}"
     } catch {
-      return "{\"error\": \"Failed to save reminder: \(error.localizedDescription)\"}"
+      return Envelope.failure(
+        .executionError, "Failed to save reminder: \(error.localizedDescription)")
     }
   }
 }
@@ -427,14 +459,14 @@ struct GetListsTool: Tool {
 
   func run(args: String) -> String {
     guard ReminderManager.shared.ensureAccess() else {
-      return "{\"error\": \"Access denied\"}"
+      return Envelope.failure(.unavailable, "Access to Reminders denied.", retryable: false)
     }
 
     let lists = ReminderManager.shared.getLists()
     let dtos = lists.map { ReminderListDTO(from: $0) }
 
     guard let json = try? JSONEncoder().encode(dtos) else {
-      return "{\"error\": \"Encoding failed\"}"
+      return Envelope.failure(.executionError, "Encoding failed")
     }
     return String(data: json, encoding: .utf8) ?? "{}"
   }
@@ -462,7 +494,7 @@ struct OpenReminderTool: Tool {
     guard let data = args.data(using: .utf8),
       let input = try? JSONDecoder().decode(Args.self, from: data)
     else {
-      return "{\"error\": \"Invalid args\"}"
+      return Envelope.failure(.invalidArgs, "Invalid arguments")
     }
 
     // Use AppleScript to activate and show
@@ -473,14 +505,18 @@ struct OpenReminderTool: Tool {
     var scriptSource = "tell application \"Reminders\" to activate"
 
     if let id = input.id {
+      guard !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        return Envelope.failure(.invalidArgs, "id must not be empty.")
+      }
       // Try to show specific reminder.
       // Note: AppleScript 'id' lookup usually needs the clean UUID or the full ID string.
-      // Let's try finding it by id.
+      // Escape the user-supplied id to avoid breaking out of the AppleScript string literal.
+      let safeId = escapeAppleScriptString(id)
       scriptSource = """
         tell application "Reminders"
             activate
             try
-                show (first reminder whose id is "\(id)")
+                show (first reminder whose id is "\(safeId)")
             on error
                 -- Fallback or ignore if not found
             end try
@@ -492,12 +528,12 @@ struct OpenReminderTool: Tool {
     if let script = NSAppleScript(source: scriptSource) {
       script.executeAndReturnError(&error)
       if let err = error {
-        return "{\"error\": \"AppleScript error: \(err)\"}"
+        return Envelope.failure(.executionError, "AppleScript error: \(err)")
       }
       return "{\"success\": true, \"message\": \"Reminders app opened\"}"
     }
 
-    return "{\"error\": \"Failed to create AppleScript\"}"
+    return Envelope.failure(.executionError, "Failed to create AppleScript")
   }
 }
 
@@ -525,14 +561,51 @@ private struct osr_plugin_api {
   var invoke: osr_invoke_t?
 }
 
+/// Canonical, ordered list of tools exposed by this plugin.
+let remindersTools: [Tool] = [
+  GetRemindersTool(),
+  SearchRemindersTool(),
+  CreateReminderTool(),
+  GetListsTool(),
+  OpenReminderTool(),
+]
+
+/// File-scope manifest JSON, extracted from the host callback so it can be unit tested.
+let remindersManifestJSON: String = {
+  let toolsJson = remindersTools.map { tool -> String in
+    let reqs = tool.requirements.map { "\"\($0)\"" }.joined(separator: ",")
+    let widgetField = tool.widget ? "\"widget\": true," : ""
+    return """
+      {
+          "id": "\(tool.name)",
+          \(widgetField)
+          "description": "\(Envelope.escape(tool.description))",
+          "parameters": \(tool.parameters),
+          "requirements": [\(reqs)],
+          "permission_policy": "\(tool.permissionPolicy)"
+      }
+      """
+  }.joined(separator: ",")
+
+  return """
+    {
+      "plugin_id": "osaurus.reminders",
+      "name": "Reminders",
+      "description": "An Osaurus plugin for interacting with macOS Reminders via EventKit.",
+      "license": "MIT",
+      "authors": ["Osaurus"],
+      "min_macos": "13.0",
+      "min_osaurus": "0.5.0",
+      "capabilities": {
+        "tools": [\(toolsJson)]
+      }
+    }
+    """
+}()
+
 private class PluginContext {
-  let tools: [String: Tool] = [
-    "get_reminders": GetRemindersTool(),
-    "search_reminders": SearchRemindersTool(),
-    "create_reminder": CreateReminderTool(),
-    "get_lists": GetListsTool(),
-    "open_reminder": OpenReminderTool(),
-  ]
+  let tools: [String: Tool] = Dictionary(
+    uniqueKeysWithValues: remindersTools.map { ($0.name, $0) })
 }
 
 private func makeCString(_ s: String) -> UnsafePointer<CChar>? {
@@ -558,40 +631,8 @@ private var api: osr_plugin_api = {
   }
 
   api.get_manifest = { ctxPtr in
-    guard let ctxPtr = ctxPtr else { return nil }
-    let ctx = Unmanaged<PluginContext>.fromOpaque(ctxPtr).takeUnretainedValue()
-
-    // Build JSON manifest dynamically
-    let toolsJson = ctx.tools.values.map { tool in
-      let reqs = tool.requirements.map { "\"\($0)\"" }.joined(separator: ",")
-      let widgetField = tool.widget ? "\"widget\": true," : ""
-      return """
-        {
-            "id": "\(tool.name)",
-            \(widgetField)
-            "description": "\(tool.description)",
-            "parameters": \(tool.parameters),
-            "requirements": [\(reqs)],
-            "permission_policy": "\(tool.permissionPolicy)"
-        }
-        """
-    }.joined(separator: ",")
-
-    let manifest = """
-      {
-        "plugin_id": "osaurus.reminders",
-        "name": "Reminders",
-        "description": "An Osaurus plugin for interacting with macOS Reminders via EventKit.",
-        "license": "MIT",
-        "authors": ["Osaurus"],
-        "min_macos": "13.0",
-        "min_osaurus": "0.5.0",
-        "capabilities": {
-          "tools": [\(toolsJson)]
-        }
-      }
-      """
-    return makeCString(manifest)
+    guard ctxPtr != nil else { return nil }
+    return makeCString(remindersManifestJSON)
   }
 
   api.invoke = { ctxPtr, typePtr, idPtr, payloadPtr in
@@ -611,7 +652,7 @@ private var api: osr_plugin_api = {
       return makeCString(result)
     }
 
-    return makeCString("{\"error\": \"Unknown capability or tool\"}")
+    return makeCString(Envelope.failure(.notFound, "Unknown capability or tool '\(id)'"))
   }
 
   return api
