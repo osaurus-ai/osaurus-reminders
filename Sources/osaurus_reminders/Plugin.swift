@@ -1,6 +1,7 @@
 import AppKit
 import EventKit
 import Foundation
+import OsaurusPluginABI
 import OsaurusPluginKit
 
 // MARK: - Helpers
@@ -601,28 +602,6 @@ struct OpenReminderTool: Tool {
 
 // MARK: - C ABI
 
-private typealias osr_free_string_t = @convention(c) (UnsafePointer<CChar>?) -> Void
-private typealias osr_init_t = @convention(c) () -> osr_plugin_ctx_t?
-private typealias osr_destroy_t = @convention(c) (osr_plugin_ctx_t?) -> Void
-private typealias osr_get_manifest_t = @convention(c) (osr_plugin_ctx_t?) -> UnsafePointer<CChar>?
-private typealias osr_invoke_t =
-  @convention(c) (
-    osr_plugin_ctx_t?,
-    UnsafePointer<CChar>?,
-    UnsafePointer<CChar>?,
-    UnsafePointer<CChar>?
-  ) -> UnsafePointer<CChar>?
-
-private typealias osr_plugin_ctx_t = UnsafeMutableRawPointer
-
-private struct osr_plugin_api {
-  var free_string: osr_free_string_t?
-  var `init`: osr_init_t?
-  var destroy: osr_destroy_t?
-  var get_manifest: osr_get_manifest_t?
-  var invoke: osr_invoke_t?
-}
-
 /// Canonical, ordered list of tools exposed by this plugin.
 let remindersTools: [Tool] = [
   GetRemindersTool(),
@@ -671,34 +650,20 @@ private class PluginContext {
     uniqueKeysWithValues: remindersTools.map { ($0.name, $0) })
 }
 
-private func makeCString(_ s: String) -> UnsafePointer<CChar>? {
-  guard let ptr = strdup(s) else { return nil }
-  return UnsafePointer(ptr)
-}
-
-private var api: osr_plugin_api = {
-  var api = osr_plugin_api()
-
-  api.free_string = { ptr in
-    if let p = ptr { free(UnsafeMutableRawPointer(mutating: p)) }
-  }
-
-  api.`init` = {
-    let ctx = PluginContext()
-    return Unmanaged.passRetained(ctx).toOpaque()
-  }
-
-  api.destroy = { ctxPtr in
+private var pluginAPI = PluginEntry.makeAPI(
+  version: OsrABIVersion.v2,
+  init: {
+    Unmanaged.passRetained(PluginContext()).toOpaque()
+  },
+  destroy: { ctxPtr in
     guard let ctxPtr = ctxPtr else { return }
     Unmanaged<PluginContext>.fromOpaque(ctxPtr).release()
-  }
-
-  api.get_manifest = { ctxPtr in
+  },
+  getManifest: { ctxPtr in
     guard ctxPtr != nil else { return nil }
-    return makeCString(remindersManifestJSON)
-  }
-
-  api.invoke = { ctxPtr, typePtr, idPtr, payloadPtr in
+    return osrMakeCString(remindersManifestJSON)
+  },
+  invoke: { ctxPtr, typePtr, idPtr, payloadPtr in
     guard let ctxPtr = ctxPtr,
       let typePtr = typePtr,
       let idPtr = idPtr,
@@ -712,16 +677,19 @@ private var api: osr_plugin_api = {
 
     if type == "tool", let tool = ctx.tools[id] {
       let result = tool.run(args: payload)
-      return makeCString(result)
+      return osrMakeCString(result)
     }
 
-    return makeCString(Envelope.failure(.notFound, "Unknown capability or tool '\(id)'"))
+    return osrMakeCString(Envelope.failure(.notFound, "Unknown capability or tool '\(id)'"))
   }
+)
 
-  return api
-}()
+@_cdecl("osaurus_plugin_entry_v2")
+public func osaurus_plugin_entry_v2(_ host: UnsafeRawPointer?) -> UnsafeRawPointer? {
+  PluginEntry.enterV2(host, api: &pluginAPI)
+}
 
 @_cdecl("osaurus_plugin_entry")
 public func osaurus_plugin_entry() -> UnsafeRawPointer? {
-  return UnsafeRawPointer(&api)
+  PluginEntry.enterV1(api: &pluginAPI)
 }
