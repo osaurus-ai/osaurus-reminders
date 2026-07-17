@@ -41,6 +41,12 @@ final class RemindersTests: XCTestCase {
     XCTAssertEqual(manifest.capabilities.tools.count, remindersTools.count)
   }
 
+  func testManifestVersionMatchesRelease() throws {
+    let data = try XCTUnwrap(remindersManifestJSON.data(using: .utf8))
+    let root = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+    XCTAssertEqual(root["version"] as? String, "1.0.4")
+  }
+
   // MARK: - Envelope
 
   private struct Failure: Decodable {
