@@ -1,6 +1,7 @@
 import AppKit
 import EventKit
 import Foundation
+import OsaurusPluginKit
 
 // MARK: - Helpers
 
