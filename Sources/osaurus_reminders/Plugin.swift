@@ -632,7 +632,7 @@ let remindersManifestJSON: String = {
     {
       "plugin_id": "osaurus.reminders",
       "name": "Reminders",
-      "version": "1.0.4",
+      "version": "1.1.0",
       "description": "An Osaurus plugin for interacting with macOS Reminders via EventKit.",
       "license": "MIT",
       "authors": ["Osaurus"],
