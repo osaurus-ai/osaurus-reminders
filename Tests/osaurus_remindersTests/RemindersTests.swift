@@ -1,3 +1,4 @@
+import OsaurusPluginKit
 import XCTest
 
 @testable import osaurus_reminders
@@ -41,6 +42,12 @@ final class RemindersTests: XCTestCase {
     XCTAssertEqual(manifest.capabilities.tools.count, remindersTools.count)
   }
 
+  func testManifestVersionMatchesRelease() throws {
+    let data = try XCTUnwrap(remindersManifestJSON.data(using: .utf8))
+    let root = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+    XCTAssertEqual(root["version"] as? String, "1.0.4")
+  }
+
   // MARK: - Envelope
 
   private struct Failure: Decodable {
@@ -63,10 +70,11 @@ final class RemindersTests: XCTestCase {
 
   func testEnvelopeDefaultRetryablePerKind() throws {
     let cases: [(Envelope.Kind, String, Bool)] = [
-      (.invalidArgs, "invalid_args", true),
+      (.invalidArgs, "invalid_args", false),
       (.executionError, "execution_error", true),
       (.notFound, "not_found", false),
-      (.unavailable, "unavailable", true),
+      (.permissionDenied, "permission_denied", false),
+      (.timeout, "timeout", true),
     ]
     for (kind, expectedKind, expectedRetryable) in cases {
       let data = try XCTUnwrap(Envelope.failure(kind, "x").data(using: .utf8))
@@ -78,9 +86,9 @@ final class RemindersTests: XCTestCase {
 
   func testEnvelopeFailureExplicitRetryableOverride() throws {
     let data = try XCTUnwrap(
-      Envelope.failure(.unavailable, "denied", retryable: false).data(using: .utf8))
+      Envelope.failure(.executionError, "flaky", retryable: false).data(using: .utf8))
     let failure = try JSONDecoder().decode(Failure.self, from: data)
-    XCTAssertEqual(failure.kind, "unavailable")
+    XCTAssertEqual(failure.kind, "execution_error")
     XCTAssertFalse(failure.retryable)
   }
 

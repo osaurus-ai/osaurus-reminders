@@ -1,6 +1,8 @@
 import AppKit
 import EventKit
 import Foundation
+import OsaurusPluginABI
+import OsaurusPluginKit
 
 // MARK: - Helpers
 
@@ -82,6 +84,26 @@ struct ReminderListDTO: Encodable {
 
 // MARK: - Manager
 
+enum ReminderAccess {
+  case granted
+  case denied
+  case timedOut
+}
+
+/// Returns a failure envelope for non-granted access, or nil when granted.
+func remindersAccessFailure(_ access: ReminderAccess) -> String? {
+  switch access {
+  case .granted:
+    return nil
+  case .denied:
+    return Envelope.failure(
+      .permissionDenied,
+      "Access to Reminders denied. Please enable in System Settings > Privacy & Security > Reminders.")
+  case .timedOut:
+    return Envelope.failure(.timeout, "Timed out waiting for Reminders permission")
+  }
+}
+
 class ReminderManager {
   static let shared = ReminderManager()
   let store = EKEventStore()
@@ -98,9 +120,13 @@ class ReminderManager {
 
   // Attempt to request access if not determined
   // Note: Requesting access is async, but we might be in a sync context.
-  // Ideally the host app handles this, but we can try blocking wait.
-  func ensureAccess() -> Bool {
-    if checkAccess() { return true }
+  // The blocking wait is deadline-bounded so a stuck permission prompt cannot
+  // hang the host indefinitely, and a timeout is distinguishable from denial.
+  func ensureAccess() -> ReminderAccess {
+    if checkAccess() { return .granted }
+
+    let status = EKEventStore.authorizationStatus(for: .reminder)
+    guard status == .notDetermined else { return .denied }
 
     let sema = DispatchSemaphore(value: 0)
     var granted = false
@@ -117,24 +143,35 @@ class ReminderManager {
       }
     }
 
-    _ = sema.wait(timeout: .now() + 20)  // Wait up to 20s
-    return granted
+    if sema.wait(timeout: .now() + 20) == .timedOut {
+      return .timedOut
+    }
+    return granted ? .granted : .denied
   }
 
   func getLists() -> [EKCalendar] {
     return store.calendars(for: .reminder)
   }
 
-  func fetchReminders(predicate: NSPredicate) -> [EKReminder] {
+  /// Fetches reminders matching the predicate. Returns nil on timeout so
+  /// callers can report a timeout instead of a misleading empty result.
+  func fetchReminders(predicate: NSPredicate, timeout: TimeInterval = 30) -> [EKReminder]? {
     let sema = DispatchSemaphore(value: 0)
-    var results: [EKReminder] = []
+    let lock = NSLock()
+    var results: [EKReminder]?
 
     store.fetchReminders(matching: predicate) { reminders in
+      lock.lock()
       results = reminders ?? []
+      lock.unlock()
       sema.signal()
     }
 
-    _ = sema.wait(timeout: .now() + 30)
+    if sema.wait(timeout: .now() + timeout) == .timedOut {
+      return nil
+    }
+    lock.lock()
+    defer { lock.unlock() }
     return results
   }
 }
@@ -178,12 +215,6 @@ struct GetRemindersTool: Tool {
     """
 
   func run(args: String) -> String {
-    guard ReminderManager.shared.ensureAccess() else {
-      return Envelope.failure(
-        .unavailable, "Access to Reminders denied. Please enable in System Settings.",
-        retryable: false)
-    }
-
     struct Args: Decodable {
       let listName: String?
       let status: String?
@@ -196,13 +227,48 @@ struct GetRemindersTool: Tool {
       let input = try? JSONDecoder().decode(Args.self, from: data)
     else { return Envelope.failure(.invalidArgs, "Invalid arguments") }
 
+    guard let status = Validation.parseStatus(input.status) else {
+      return Envelope.failure(
+        .invalidArgs,
+        "status must be one of 'incomplete', 'completed', 'all', got '\(input.status ?? "")'")
+    }
+
+    let limit: Int
+    switch Validation.resolveLimit(input.limit, default: 50) {
+    case .ok(let value): limit = value
+    case .invalid(let message): return Envelope.failure(.invalidArgs, message)
+    }
+
+    var start: Date? = nil
+    if let dueAfter = input.dueAfter {
+      guard let parsed = Validation.parseISODate(dueAfter) else {
+        return Envelope.failure(.invalidArgs, "Invalid date for field 'dueAfter': \(dueAfter)")
+      }
+      start = parsed
+    }
+
+    var end: Date? = nil
+    if let dueBefore = input.dueBefore {
+      guard let parsed = Validation.parseISODate(dueBefore) else {
+        return Envelope.failure(.invalidArgs, "Invalid date for field 'dueBefore': \(dueBefore)")
+      }
+      end = parsed
+    }
+
+    if let listName = input.listName,
+      listName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    {
+      return Envelope.failure(.invalidArgs, "listName must not be empty.")
+    }
+
+    if let failure = remindersAccessFailure(ReminderManager.shared.ensureAccess()) {
+      return failure
+    }
+
     let store = ReminderManager.shared.store
     var calendars: [EKCalendar]? = nil
 
     if let listName = input.listName {
-      guard !listName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-        return Envelope.failure(.invalidArgs, "listName must not be empty.")
-      }
       let all = ReminderManager.shared.getLists()
       if let match = all.first(where: { $0.title.caseInsensitiveCompare(listName) == .orderedSame })
       {
@@ -212,77 +278,51 @@ struct GetRemindersTool: Tool {
       }
     }
 
-    // Predicate construction
-    // EKEventStore.predicateForReminders(in: calendars) returns all incomplete
-    // To get completed, we must use fetchReminders directly or filter manually?
-    // Actually predicateForReminders(in:) gets *incomplete* reminders by default in documentation?
-    // Wait, predicateForReminders(in:) returns a predicate for *all* reminders if no completion status is specified?
-    // Documentation says "Creates a predicate for fetching reminders."
-    // We usually use predicateForIncompleteReminders(...) or predicateForCompletedReminders(...)
-    // But those methods are: predicateForIncompleteReminders(withDueDateStarting:ending:calendars:)
-    // and predicateForCompletedReminders(withCompletionDateStarting:ending:calendars:)
-
-    let status = input.status ?? "incomplete"
-    var predicate: NSPredicate
-
-    let isoFormatter = ISO8601DateFormatter()
-    isoFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    // Fallback for non-fractional
-    let isoFormatter2 = ISO8601DateFormatter()
-    isoFormatter2.formatOptions = [.withInternetDateTime]
-
-    func parse(_ s: String) -> Date? {
-      return isoFormatter.date(from: s) ?? isoFormatter2.date(from: s)
+    // Predicate construction: incomplete reminders can be constrained by due
+    // date natively. predicateForCompletedReminders only constrains the
+    // COMPLETION date, so completed reminders are fetched unconstrained and
+    // filtered by DUE date in memory (matching the parameter names).
+    func fetchIncomplete() -> [EKReminder]? {
+      let p = store.predicateForIncompleteReminders(
+        withDueDateStarting: start, ending: end, calendars: calendars)
+      return ReminderManager.shared.fetchReminders(predicate: p)
     }
 
-    let start = input.dueAfter.flatMap(parse)
-    let end = input.dueBefore.flatMap(parse)
-
-    if status == "incomplete" {
-      predicate = store.predicateForIncompleteReminders(
-        withDueDateStarting: start, ending: end, calendars: calendars)
-    } else if status == "completed" {
-      // "completed" usually filters by completion date, but here we might want due date?
-      // predicateForCompletedReminders uses completion date range.
-      predicate = store.predicateForCompletedReminders(
-        withCompletionDateStarting: start, ending: end, calendars: calendars)
-    } else {
-      // "all" - this is harder with predicates. Usually we have to fetch both or construct a custom predicate?
-      // EKEventStore predicates are opaque. We cannot OR them easily.
-      // We'll fetch incomplete, and if requested "all", we might need another fetch?
-      // For simplicity, let's just support incomplete/completed. If "all", we might just return incomplete for now or fetch both.
-      // Let's fetch both if "all"
-      let p1 = store.predicateForIncompleteReminders(
-        withDueDateStarting: start, ending: end, calendars: calendars)
-      let p2 = store.predicateForCompletedReminders(
-        withCompletionDateStarting: start, ending: end, calendars: calendars)
-
-      var allReminders = ReminderManager.shared.fetchReminders(predicate: p1)
-      allReminders.append(contentsOf: ReminderManager.shared.fetchReminders(predicate: p2))
-
-      // Sort and limit
-      allReminders.sort { ($0.creationDate ?? Date()) > ($1.creationDate ?? Date()) }
-      let limit = input.limit ?? 50
-      let limited = Array(allReminders.prefix(limit))
-
-      let dtos = limited.map { ReminderDTO(from: $0) }
-      guard let json = try? JSONEncoder().encode(dtos) else {
-        return Envelope.failure(.executionError, "Encoding failed")
+    func fetchCompleted() -> [EKReminder]? {
+      let p = store.predicateForCompletedReminders(
+        withCompletionDateStarting: nil, ending: nil, calendars: calendars)
+      guard let fetched = ReminderManager.shared.fetchReminders(predicate: p) else { return nil }
+      return fetched.filter {
+        Validation.dueDateInRange($0.dueDateComponents?.date, after: start, before: end)
       }
-      return String(data: json, encoding: .utf8) ?? "{}"
     }
 
-    // Single predicate path
-    var reminders = ReminderManager.shared.fetchReminders(predicate: predicate)
+    var reminders: [EKReminder]
 
-    // Sort (by due date? creation?)
+    switch status {
+    case .incomplete:
+      guard let fetched = fetchIncomplete() else {
+        return Envelope.failure(.timeout, "Reminders query timed out")
+      }
+      reminders = fetched
+    case .completed:
+      guard let fetched = fetchCompleted() else {
+        return Envelope.failure(.timeout, "Reminders query timed out")
+      }
+      reminders = fetched
+    case .all:
+      guard let incomplete = fetchIncomplete(), let completed = fetchCompleted() else {
+        return Envelope.failure(.timeout, "Reminders query timed out")
+      }
+      reminders = incomplete + completed
+    }
+
     reminders.sort {
       let d1 = $0.dueDateComponents?.date ?? $0.creationDate ?? Date.distantPast
       let d2 = $1.dueDateComponents?.date ?? $1.creationDate ?? Date.distantPast
       return d1 < d2
     }
 
-    let limit = input.limit ?? 50
     let limited = Array(reminders.prefix(limit))
 
     let dtos = limited.map { ReminderDTO(from: $0) }
@@ -296,7 +336,8 @@ struct GetRemindersTool: Tool {
 // 2. Search Reminders
 struct SearchRemindersTool: Tool {
   let name = "search_reminders"
-  let description = "Search reminders by title or notes."
+  let description =
+    "Search reminders by title or notes. Searches all incomplete reminders plus reminders completed within the last 30 days."
   let requirements = ["reminders"]
   let parameters = """
     {
@@ -310,10 +351,6 @@ struct SearchRemindersTool: Tool {
     """
 
   func run(args: String) -> String {
-    guard ReminderManager.shared.ensureAccess() else {
-      return Envelope.failure(.unavailable, "Access to Reminders denied.", retryable: false)
-    }
-
     struct Args: Decodable {
       let searchText: String
       let limit: Int?
@@ -324,6 +361,20 @@ struct SearchRemindersTool: Tool {
       return Envelope.failure(.invalidArgs, "Invalid arguments")
     }
 
+    guard !input.searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+      return Envelope.failure(.invalidArgs, "searchText must not be empty.")
+    }
+
+    let limit: Int
+    switch Validation.resolveLimit(input.limit, default: 20) {
+    case .ok(let value): limit = value
+    case .invalid(let message): return Envelope.failure(.invalidArgs, message)
+    }
+
+    if let failure = remindersAccessFailure(ReminderManager.shared.ensureAccess()) {
+      return failure
+    }
+
     // We fetch all incomplete (and maybe recent completed?) and filter in memory since
     // there is no text search predicate in EventKit.
     let store = ReminderManager.shared.store
@@ -331,13 +382,18 @@ struct SearchRemindersTool: Tool {
       withDueDateStarting: nil, ending: nil, calendars: nil)
 
     // NOTE: Searching ALL reminders (including completed history) can be slow.
-    // We'll search incomplete reminders and maybe last 30 days of completed?
+    // We'll search incomplete reminders and the last 30 days of completed ones
+    // (as documented in the tool description).
     let oneMonthAgo = Calendar.current.date(byAdding: .day, value: -30, to: Date())
     let p2 = store.predicateForCompletedReminders(
       withCompletionDateStarting: oneMonthAgo, ending: nil, calendars: nil)
 
-    var all = ReminderManager.shared.fetchReminders(predicate: p1)
-    all.append(contentsOf: ReminderManager.shared.fetchReminders(predicate: p2))
+    guard var all = ReminderManager.shared.fetchReminders(predicate: p1),
+      let completed = ReminderManager.shared.fetchReminders(predicate: p2)
+    else {
+      return Envelope.failure(.timeout, "Reminders query timed out")
+    }
+    all.append(contentsOf: completed)
 
     let query = input.searchText.lowercased()
     let filtered = all.filter {
@@ -345,7 +401,6 @@ struct SearchRemindersTool: Tool {
         || ($0.notes?.lowercased().contains(query) ?? false)
     }
 
-    let limit = input.limit ?? 20
     let limited = Array(filtered.prefix(limit))
 
     let dtos = limited.map { ReminderDTO(from: $0) }
@@ -376,10 +431,6 @@ struct CreateReminderTool: Tool {
     """
 
   func run(args: String) -> String {
-    guard ReminderManager.shared.ensureAccess() else {
-      return Envelope.failure(.unavailable, "Access to Reminders denied.", retryable: false)
-    }
-
     struct Args: Decodable {
       let title: String
       let notes: String?
@@ -398,6 +449,31 @@ struct CreateReminderTool: Tool {
       return Envelope.failure(.invalidArgs, "title must not be empty.")
     }
 
+    if let message = Validation.priorityError(input.priority) {
+      return Envelope.failure(.invalidArgs, message)
+    }
+
+    if let listName = input.listName,
+      listName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    {
+      return Envelope.failure(.invalidArgs, "listName must not be empty.")
+    }
+
+    var dueComponents: DateComponents? = nil
+    if let dueStr = input.dueDate {
+      guard let date = Validation.parseISODate(dueStr) else {
+        return Envelope.failure(
+          .invalidArgs,
+          "Invalid date for field 'dueDate': \(dueStr). Use ISO format (YYYY-MM-DDTHH:mm:ssZ)")
+      }
+      dueComponents = Calendar.current.dateComponents(
+        [.year, .month, .day, .hour, .minute, .second], from: date)
+    }
+
+    if let failure = remindersAccessFailure(ReminderManager.shared.ensureAccess()) {
+      return failure
+    }
+
     let store = ReminderManager.shared.store
     let reminder = EKReminder(eventStore: store)
 
@@ -408,11 +484,12 @@ struct CreateReminderTool: Tool {
       reminder.priority = priority
     }
 
+    if let dueComponents {
+      reminder.dueDateComponents = dueComponents
+    }
+
     // Handle List
     if let listName = input.listName {
-      guard !listName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-        return Envelope.failure(.invalidArgs, "listName must not be empty.")
-      }
       if let list = ReminderManager.shared.getLists().first(where: {
         $0.title.caseInsensitiveCompare(listName) == .orderedSame
       }) {
@@ -422,20 +499,6 @@ struct CreateReminderTool: Tool {
       }
     } else {
       reminder.calendar = store.defaultCalendarForNewReminders()
-    }
-
-    // Handle Due Date
-    if let dueStr = input.dueDate {
-      let isoFormatter = ISO8601DateFormatter()
-      isoFormatter.formatOptions = [.withInternetDateTime]
-      if let date = isoFormatter.date(from: dueStr) {
-        let components = Calendar.current.dateComponents(
-          [.year, .month, .day, .hour, .minute, .second], from: date)
-        reminder.dueDateComponents = components
-      } else {
-        // Try fallback format (without time?)
-        // Or simply warn.
-      }
     }
 
     do {
@@ -458,8 +521,8 @@ struct GetListsTool: Tool {
   let parameters = "{ \"type\": \"object\", \"properties\": {} }"
 
   func run(args: String) -> String {
-    guard ReminderManager.shared.ensureAccess() else {
-      return Envelope.failure(.unavailable, "Access to Reminders denied.", retryable: false)
+    if let failure = remindersAccessFailure(ReminderManager.shared.ensureAccess()) {
+      return failure
     }
 
     let lists = ReminderManager.shared.getLists()
@@ -539,28 +602,6 @@ struct OpenReminderTool: Tool {
 
 // MARK: - C ABI
 
-private typealias osr_free_string_t = @convention(c) (UnsafePointer<CChar>?) -> Void
-private typealias osr_init_t = @convention(c) () -> osr_plugin_ctx_t?
-private typealias osr_destroy_t = @convention(c) (osr_plugin_ctx_t?) -> Void
-private typealias osr_get_manifest_t = @convention(c) (osr_plugin_ctx_t?) -> UnsafePointer<CChar>?
-private typealias osr_invoke_t =
-  @convention(c) (
-    osr_plugin_ctx_t?,
-    UnsafePointer<CChar>?,
-    UnsafePointer<CChar>?,
-    UnsafePointer<CChar>?
-  ) -> UnsafePointer<CChar>?
-
-private typealias osr_plugin_ctx_t = UnsafeMutableRawPointer
-
-private struct osr_plugin_api {
-  var free_string: osr_free_string_t?
-  var `init`: osr_init_t?
-  var destroy: osr_destroy_t?
-  var get_manifest: osr_get_manifest_t?
-  var invoke: osr_invoke_t?
-}
-
 /// Canonical, ordered list of tools exposed by this plugin.
 let remindersTools: [Tool] = [
   GetRemindersTool(),
@@ -591,6 +632,7 @@ let remindersManifestJSON: String = {
     {
       "plugin_id": "osaurus.reminders",
       "name": "Reminders",
+      "version": "1.0.4",
       "description": "An Osaurus plugin for interacting with macOS Reminders via EventKit.",
       "license": "MIT",
       "authors": ["Osaurus"],
@@ -608,34 +650,20 @@ private class PluginContext {
     uniqueKeysWithValues: remindersTools.map { ($0.name, $0) })
 }
 
-private func makeCString(_ s: String) -> UnsafePointer<CChar>? {
-  guard let ptr = strdup(s) else { return nil }
-  return UnsafePointer(ptr)
-}
-
-private var api: osr_plugin_api = {
-  var api = osr_plugin_api()
-
-  api.free_string = { ptr in
-    if let p = ptr { free(UnsafeMutableRawPointer(mutating: p)) }
-  }
-
-  api.`init` = {
-    let ctx = PluginContext()
-    return Unmanaged.passRetained(ctx).toOpaque()
-  }
-
-  api.destroy = { ctxPtr in
+private var pluginAPI = PluginEntry.makeAPI(
+  version: OsrABIVersion.v2,
+  init: {
+    Unmanaged.passRetained(PluginContext()).toOpaque()
+  },
+  destroy: { ctxPtr in
     guard let ctxPtr = ctxPtr else { return }
     Unmanaged<PluginContext>.fromOpaque(ctxPtr).release()
-  }
-
-  api.get_manifest = { ctxPtr in
+  },
+  getManifest: { ctxPtr in
     guard ctxPtr != nil else { return nil }
-    return makeCString(remindersManifestJSON)
-  }
-
-  api.invoke = { ctxPtr, typePtr, idPtr, payloadPtr in
+    return osrMakeCString(remindersManifestJSON)
+  },
+  invoke: { ctxPtr, typePtr, idPtr, payloadPtr in
     guard let ctxPtr = ctxPtr,
       let typePtr = typePtr,
       let idPtr = idPtr,
@@ -649,16 +677,19 @@ private var api: osr_plugin_api = {
 
     if type == "tool", let tool = ctx.tools[id] {
       let result = tool.run(args: payload)
-      return makeCString(result)
+      return osrMakeCString(result)
     }
 
-    return makeCString(Envelope.failure(.notFound, "Unknown capability or tool '\(id)'"))
+    return osrMakeCString(Envelope.failure(.notFound, "Unknown capability or tool '\(id)'"))
   }
+)
 
-  return api
-}()
+@_cdecl("osaurus_plugin_entry_v2")
+public func osaurus_plugin_entry_v2(_ host: UnsafeRawPointer?) -> UnsafeRawPointer? {
+  PluginEntry.enterV2(host, api: &pluginAPI)
+}
 
 @_cdecl("osaurus_plugin_entry")
 public func osaurus_plugin_entry() -> UnsafeRawPointer? {
-  return UnsafeRawPointer(&api)
+  PluginEntry.enterV1(api: &pluginAPI)
 }
