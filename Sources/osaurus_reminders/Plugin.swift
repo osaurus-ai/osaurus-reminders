@@ -423,7 +423,7 @@ struct CreateReminderTool: Tool {
             "title": { "type": "string" },
             "notes": { "type": "string" },
             "listName": { "type": "string" },
-            "dueDate": { "type": "string", "description": "ISO date string; a notification alarm fires at this time" },
+            "dueDate": { "type": "string", "description": "ISO date string (YYYY-MM-DDTHH:mm:ssZ or with UTC offset); a notification alarm fires at this time. REQUIRED whenever the user mentions a date or time. For relative times ('tomorrow at 8 AM', 'in 20 minutes'), first resolve the current date and time (e.g. via get_current_time), then pass the absolute date-time in the user's timezone. Never omit this field when the user asked to be reminded at a specific time." },
             "priority": { "type": "integer", "description": "1-9 (1 is highest, 5 is medium, 9 is low)" }
         },
         "required": ["title"]
@@ -638,7 +638,7 @@ let remindersManifestJSON: String = {
     {
       "plugin_id": "osaurus.reminders",
       "name": "Reminders",
-      "version": "1.1.1",
+      "version": "1.1.2",
       "description": "An Osaurus plugin for interacting with macOS Reminders via EventKit.",
       "license": "MIT",
       "authors": ["Osaurus"],
