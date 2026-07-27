@@ -45,7 +45,7 @@ final class RemindersTests: XCTestCase {
   func testManifestVersionMatchesRelease() throws {
     let data = try XCTUnwrap(remindersManifestJSON.data(using: .utf8))
     let root = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
-    XCTAssertEqual(root["version"] as? String, "1.1.0")
+    XCTAssertEqual(root["version"] as? String, "1.1.1")
   }
 
   // MARK: - Envelope

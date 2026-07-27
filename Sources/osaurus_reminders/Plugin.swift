@@ -423,7 +423,7 @@ struct CreateReminderTool: Tool {
             "title": { "type": "string" },
             "notes": { "type": "string" },
             "listName": { "type": "string" },
-            "dueDate": { "type": "string", "description": "ISO date string" },
+            "dueDate": { "type": "string", "description": "ISO date string; a notification alarm fires at this time" },
             "priority": { "type": "integer", "description": "1-9 (1 is highest, 5 is medium, 9 is low)" }
         },
         "required": ["title"]
@@ -486,6 +486,12 @@ struct CreateReminderTool: Tool {
 
     if let dueComponents {
       reminder.dueDateComponents = dueComponents
+      // A due date alone is only metadata; macOS fires a notification for a
+      // reminder only when it has an alarm, so mirror what Reminders.app does
+      // for "remind me at" and attach an absolute alarm at the due date.
+      if let alarmDate = Calendar.current.date(from: dueComponents) {
+        reminder.addAlarm(EKAlarm(absoluteDate: alarmDate))
+      }
     }
 
     // Handle List
@@ -632,7 +638,7 @@ let remindersManifestJSON: String = {
     {
       "plugin_id": "osaurus.reminders",
       "name": "Reminders",
-      "version": "1.1.0",
+      "version": "1.1.1",
       "description": "An Osaurus plugin for interacting with macOS Reminders via EventKit.",
       "license": "MIT",
       "authors": ["Osaurus"],
