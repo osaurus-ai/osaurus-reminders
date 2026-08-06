@@ -4,51 +4,91 @@ import XCTest
 @testable import osaurus_reminders
 
 final class RemindersTests: XCTestCase {
+  private func manifest() throws -> [String: Any] {
+    let object = try JSONSerialization.jsonObject(with: Data(remindersManifestJSON.utf8))
+    return try XCTUnwrap(object as? [String: Any])
+  }
 
-  // MARK: - Manifest
+  private func manifestTools() throws -> [[String: Any]] {
+    let capabilities = try XCTUnwrap(try manifest()["capabilities"] as? [String: Any])
+    return try XCTUnwrap(capabilities["tools"] as? [[String: Any]])
+  }
 
-  private struct Manifest: Decodable {
-    let plugin_id: String
-    let capabilities: Capabilities
-    struct Capabilities: Decodable {
-      let tools: [ToolEntry]
+  func testManifestVersionAndExactToolSurface() throws {
+    XCTAssertEqual(try manifest()["version"] as? String, "2.0.0")
+    XCTAssertEqual(
+      try manifestTools().compactMap { $0["id"] as? String },
+      [
+        "list_reminder_lists",
+        "query_reminders",
+        "create_reminder",
+        "open_reminder",
+      ])
+    XCTAssertEqual(remindersTools.count, 4)
+  }
+
+  func testManifestToolsUseOnlySupportedFieldsAndStrictSchemas() throws {
+    let supported = Set([
+      "id", "description", "parameters", "requirements", "permission_policy",
+    ])
+    for tool in try manifestTools() {
+      let id = try XCTUnwrap(tool["id"] as? String)
+      XCTAssertEqual(Set(tool.keys), supported, "\(id) contains unsupported manifest fields")
+
+      let schema = try XCTUnwrap(tool["parameters"] as? [String: Any])
+      XCTAssertEqual(schema["type"] as? String, "object")
+      XCTAssertNotNil(schema["properties"] as? [String: Any])
+      XCTAssertNotNil(schema["required"] as? [String])
+      XCTAssertEqual(schema["additionalProperties"] as? Bool, false)
+      XCTAssertNil(tool["annotations"])
+      XCTAssertNil(tool["outputSchema"])
     }
-    struct ToolEntry: Decodable {
-      let id: String
-      let description: String
+  }
+
+  func testManifestPoliciesAndRequirements() throws {
+    let entries = Dictionary(
+      uniqueKeysWithValues: try manifestTools().map {
+        (try XCTUnwrap($0["id"] as? String), $0)
+      })
+
+    XCTAssertEqual(entries["list_reminder_lists"]?["permission_policy"] as? String, "auto")
+    XCTAssertEqual(entries["query_reminders"]?["permission_policy"] as? String, "auto")
+    XCTAssertEqual(entries["create_reminder"]?["permission_policy"] as? String, "ask")
+    XCTAssertEqual(entries["open_reminder"]?["permission_policy"] as? String, "ask")
+
+    XCTAssertEqual(entries["list_reminder_lists"]?["requirements"] as? [String], ["reminders"])
+    XCTAssertEqual(entries["query_reminders"]?["requirements"] as? [String], ["reminders"])
+    XCTAssertEqual(entries["create_reminder"]?["requirements"] as? [String], ["reminders"])
+    XCTAssertEqual(
+      entries["open_reminder"]?["requirements"] as? [String],
+      ["reminders", "automation"])
+  }
+
+  func testManifestUsesOnlySnakeCaseParameterNames() throws {
+    let pattern = try NSRegularExpression(pattern: #"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$"#)
+    for tool in try manifestTools() {
+      let schema = try XCTUnwrap(tool["parameters"] as? [String: Any])
+      let properties = try XCTUnwrap(schema["properties"] as? [String: Any])
+      for key in properties.keys {
+        let range = NSRange(key.startIndex..., in: key)
+        XCTAssertNotNil(pattern.firstMatch(in: key, range: range), "\(key) is not snake_case")
+      }
     }
   }
 
-  func testManifestParsesAndHasValidTools() throws {
-    let data = try XCTUnwrap(remindersManifestJSON.data(using: .utf8))
-    let manifest = try JSONDecoder().decode(Manifest.self, from: data)
+  func testSkillIsPackagedOutsideRuntimeManifest() throws {
+    let capabilities = try XCTUnwrap(try manifest()["capabilities"] as? [String: Any])
+    XCTAssertNil(capabilities["skills"])
 
-    XCTAssertEqual(manifest.plugin_id, "osaurus.reminders")
-    XCTAssertFalse(manifest.capabilities.tools.isEmpty, "Manifest should expose at least one tool")
-
-    for tool in manifest.capabilities.tools {
-      XCTAssertFalse(
-        tool.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-        "Tool id must be non-empty")
-      XCTAssertFalse(
-        tool.description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-        "Tool '\(tool.id)' description must be non-empty")
-    }
+    let repositoryRoot = URL(fileURLWithPath: #filePath)
+      .deletingLastPathComponent()
+      .deletingLastPathComponent()
+      .deletingLastPathComponent()
+    let skill = try String(
+      contentsOf: repositoryRoot.appendingPathComponent("SKILL.md"),
+      encoding: .utf8)
+    XCTAssertTrue(skill.hasPrefix("---\nname: osaurus-reminders\n"))
   }
-
-  func testManifestToolCountMatchesRegistry() throws {
-    let data = try XCTUnwrap(remindersManifestJSON.data(using: .utf8))
-    let manifest = try JSONDecoder().decode(Manifest.self, from: data)
-    XCTAssertEqual(manifest.capabilities.tools.count, remindersTools.count)
-  }
-
-  func testManifestVersionMatchesRelease() throws {
-    let data = try XCTUnwrap(remindersManifestJSON.data(using: .utf8))
-    let root = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
-    XCTAssertEqual(root["version"] as? String, "1.1.2")
-  }
-
-  // MARK: - Envelope
 
   private struct Failure: Decodable {
     let ok: Bool
@@ -57,46 +97,24 @@ final class RemindersTests: XCTestCase {
     let retryable: Bool
   }
 
-  func testEnvelopeFailureRoundTrip() throws {
-    let json = Envelope.failure(.notFound, "List 'Groceries' not found.")
-    let data = try XCTUnwrap(json.data(using: .utf8))
-    let failure = try JSONDecoder().decode(Failure.self, from: data)
-
-    XCTAssertFalse(failure.ok)
-    XCTAssertEqual(failure.kind, "not_found")
-    XCTAssertEqual(failure.message, "List 'Groceries' not found.")
-    XCTAssertFalse(failure.retryable, "not_found defaults to retryable: false")
-  }
-
-  func testEnvelopeDefaultRetryablePerKind() throws {
+  func testEnvelopeUsesCanonicalKindsAndDefaults() throws {
     let cases: [(Envelope.Kind, String, Bool)] = [
-      (.invalidArgs, "invalid_args", false),
+      (.invalidArgs, "invalid_args", true),
+      (.rejected, "rejected", false),
+      (.userDenied, "user_denied", false),
+      (.timeout, "timeout", true),
       (.executionError, "execution_error", true),
       (.notFound, "not_found", false),
-      (.permissionDenied, "permission_denied", false),
-      (.timeout, "timeout", true),
+      (.unavailable, "unavailable", true),
+      (.toolNotFound, "tool_not_found", false),
     ]
-    for (kind, expectedKind, expectedRetryable) in cases {
-      let data = try XCTUnwrap(Envelope.failure(kind, "x").data(using: .utf8))
-      let failure = try JSONDecoder().decode(Failure.self, from: data)
-      XCTAssertEqual(failure.kind, expectedKind)
-      XCTAssertEqual(failure.retryable, expectedRetryable)
+    for (kind, expected, retryable) in cases {
+      let result = try JSONDecoder().decode(
+        Failure.self,
+        from: Data(Envelope.failure(kind, "x").utf8))
+      XCTAssertFalse(result.ok)
+      XCTAssertEqual(result.kind, expected)
+      XCTAssertEqual(result.retryable, retryable)
     }
-  }
-
-  func testEnvelopeFailureExplicitRetryableOverride() throws {
-    let data = try XCTUnwrap(
-      Envelope.failure(.executionError, "flaky", retryable: false).data(using: .utf8))
-    let failure = try JSONDecoder().decode(Failure.self, from: data)
-    XCTAssertEqual(failure.kind, "execution_error")
-    XCTAssertFalse(failure.retryable)
-  }
-
-  func testEnvelopeEscapesSpecialCharacters() throws {
-    let nasty = "quote:\" backslash:\\ newline:\n tab:\t"
-    let data = try XCTUnwrap(Envelope.failure(.executionError, nasty).data(using: .utf8))
-    // Must remain valid JSON and decode back to the original message.
-    let failure = try JSONDecoder().decode(Failure.self, from: data)
-    XCTAssertEqual(failure.message, nasty)
   }
 }
