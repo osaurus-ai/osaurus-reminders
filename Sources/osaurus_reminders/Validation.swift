@@ -1,36 +1,35 @@
 import Foundation
+import OsaurusPluginKit
 
 /// Pure argument-validation and result-shaping helpers, kept framework-free so
 /// they can be unit tested without EventKit/TCC access.
 enum Validation {
-  static let maxLimit = 1000
+  static let maxQueryLimit = 200
+  static let maxListLimit = 200
 
-  enum LimitResult: Equatable {
-    case ok(Int)
-    case invalid(String)
-  }
-
-  /// Resolves a requested limit against a default, rejecting non-positive
-  /// values (negative values trap in `prefix(_:)`) and clamping huge ones.
-  static func resolveLimit(_ requested: Int?, default defaultLimit: Int) -> LimitResult {
-    guard let requested else { return .ok(defaultLimit) }
-    guard requested > 0 else {
-      return .invalid("limit must be a positive integer, got \(requested)")
+  static func resolveLimit(_ raw: Any?, defaultValue: Int) throws -> Int {
+    guard let raw, !(raw is NSNull) else { return defaultValue }
+    guard !(raw is Bool), let value = raw as? Int else {
+      throw EnvelopeFailure(
+        .invalidArgs,
+        "limit must be an integer",
+        field: "limit",
+        expected: "integer from 1 through \(maxQueryLimit)")
     }
-    return .ok(min(requested, maxLimit))
+    guard (1...maxQueryLimit).contains(value) else {
+      throw EnvelopeFailure(
+        .invalidArgs,
+        "limit must be between 1 and \(maxQueryLimit)",
+        field: "limit",
+        expected: "integer from 1 through \(maxQueryLimit)")
+    }
+    return value
   }
 
   enum Status: String {
     case incomplete
     case completed
     case all
-  }
-
-  /// Parses the status filter; nil input defaults to incomplete, unknown
-  /// values are rejected instead of silently treated as a default.
-  static func parseStatus(_ raw: String?) -> Status? {
-    guard let raw else { return .incomplete }
-    return Status(rawValue: raw)
   }
 
   private static let isoFractionalFormatter: ISO8601DateFormatter = {
@@ -45,17 +44,27 @@ enum Validation {
     return f
   }()
 
-  static func parseISODate(_ s: String) -> Date? {
+  static func parseRFC3339(_ s: String) -> Date? {
     return isoFractionalFormatter.date(from: s) ?? isoFormatter.date(from: s)
   }
 
-  /// Reminder priorities are 1 (highest) through 9 (lowest) per the manifest.
-  static func priorityError(_ priority: Int?) -> String? {
-    guard let priority else { return nil }
-    guard (1...9).contains(priority) else {
-      return "priority must be between 1 and 9, got \(priority)"
+  static func optionalPriority(_ raw: Any?) throws -> Int? {
+    guard let raw, !(raw is NSNull) else { return nil }
+    guard !(raw is Bool), let priority = raw as? Int else {
+      throw EnvelopeFailure(
+        .invalidArgs,
+        "priority must be an integer",
+        field: "priority",
+        expected: "integer from 1 through 9")
     }
-    return nil
+    guard (1...9).contains(priority) else {
+      throw EnvelopeFailure(
+        .invalidArgs,
+        "priority must be between 1 and 9",
+        field: "priority",
+        expected: "integer from 1 through 9")
+    }
+    return priority
   }
 
   /// Due-date range filter used for completed reminders, whose EventKit

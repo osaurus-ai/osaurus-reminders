@@ -32,7 +32,7 @@ final class SDKConformanceTests: XCTestCase {
     defer { api.destroy?(ctx) }
 
     let resultPtr = "tool".withCString { type in
-      "get_reminders".withCString { id in
+      "query_reminders".withCString { id in
         "not json".withCString { payload in
           api.invoke?(ctx, type, id, payload)
         }

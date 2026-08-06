@@ -2,114 +2,102 @@ import XCTest
 
 @testable import osaurus_reminders
 
-/// Regression tests for tool-level argument validation. All invalid-args paths
-/// return before any EventKit access, so these run without TCC permission.
 final class ToolValidationTests: XCTestCase {
-
   private struct Failure: Decodable {
     let ok: Bool
     let kind: String
     let message: String
+    let field: String?
+    let tool: String?
     let retryable: Bool
   }
 
-  private func decodeFailure(_ json: String, file: StaticString = #filePath, line: UInt = #line)
-    throws -> Failure
-  {
+  private func failure(
+    _ json: String,
+    file: StaticString = #filePath,
+    line: UInt = #line
+  ) throws -> Failure {
     let data = try XCTUnwrap(json.data(using: .utf8), file: file, line: line)
-    return try JSONDecoder().decode(Failure.self, from: data)
+    let result = try JSONDecoder().decode(Failure.self, from: data)
+    XCTAssertFalse(result.ok, file: file, line: line)
+    XCTAssertEqual(result.kind, "invalid_args", file: file, line: line)
+    XCTAssertTrue(result.retryable, file: file, line: line)
+    return result
   }
 
-  // MARK: - get_reminders
-
-  func testGetRemindersRejectsMalformedJSON() throws {
-    let failure = try decodeFailure(GetRemindersTool().run(args: "not json"))
-    XCTAssertEqual(failure.kind, "invalid_args")
-    XCTAssertFalse(failure.retryable)
+  func testListRejectsUnknownArguments() throws {
+    let result = try failure(ListReminderListsTool().run(args: #"{"limit":10}"#))
+    XCTAssertEqual(result.field, "limit")
+    XCTAssertEqual(result.tool, "list_reminder_lists")
   }
 
-  func testGetRemindersRejectsNegativeLimit() throws {
-    // Regression: negative limit used to reach prefix(_:) and trap.
-    let failure = try decodeFailure(GetRemindersTool().run(args: #"{"limit": -5}"#))
-    XCTAssertEqual(failure.kind, "invalid_args")
-    XCTAssertTrue(failure.message.contains("limit"))
+  func testQueryRejectsMalformedJSON() throws {
+    let result = try failure(QueryRemindersTool().run(args: "not json"))
+    XCTAssertEqual(result.tool, "query_reminders")
   }
 
-  func testGetRemindersRejectsUnknownStatus() throws {
-    // Regression: unknown status was silently treated as "all".
-    let failure = try decodeFailure(GetRemindersTool().run(args: #"{"status": "done"}"#))
-    XCTAssertEqual(failure.kind, "invalid_args")
-    XCTAssertTrue(failure.message.contains("status"))
+  func testQueryRejectsLegacyNamesAndListTitles() throws {
+    for payload in [
+      #"{"searchText":"milk"}"#,
+      #"{"listName":"Groceries"}"#,
+      #"{"list_name":"Groceries"}"#,
+      #"{"dueAfter":"2026-08-06T17:00:00Z"}"#,
+    ] {
+      let result = try failure(QueryRemindersTool().run(args: payload))
+      XCTAssertTrue(result.message.contains("Unknown argument"))
+    }
   }
 
-  func testGetRemindersRejectsInvalidDueAfter() throws {
-    // Regression: invalid dates were silently ignored.
-    let failure = try decodeFailure(GetRemindersTool().run(args: #"{"dueAfter": "yesterday"}"#))
-    XCTAssertEqual(failure.kind, "invalid_args")
-    XCTAssertTrue(failure.message.contains("dueAfter"))
+  func testQueryRejectsInvalidFiltersBeforeAccess() throws {
+    let cases = [
+      (#"{"query":"  "}"#, "query"),
+      (#"{"list_id":""}"#, "list_id"),
+      (#"{"status":"done"}"#, "status"),
+      (#"{"due_after":"tomorrow"}"#, "due_after"),
+      (#"{"due_before":"2026-08-06"}"#, "due_before"),
+      (#"{"limit":0}"#, "limit"),
+      (#"{"limit":201}"#, "limit"),
+    ]
+    for (payload, field) in cases {
+      let result = try failure(QueryRemindersTool().run(args: payload))
+      XCTAssertEqual(result.field, field)
+    }
   }
 
-  func testGetRemindersRejectsInvalidDueBefore() throws {
-    let failure = try decodeFailure(GetRemindersTool().run(args: #"{"dueBefore": "13/13/2026"}"#))
-    XCTAssertEqual(failure.kind, "invalid_args")
-    XCTAssertTrue(failure.message.contains("dueBefore"))
+  func testQueryRejectsReversedDateRange() throws {
+    let result = try failure(
+      QueryRemindersTool().run(
+        args:
+          #"{"due_after":"2026-08-07T00:00:00Z","due_before":"2026-08-06T00:00:00Z"}"#))
+    XCTAssertEqual(result.field, "due_after")
   }
 
-  func testGetRemindersRejectsEmptyListName() throws {
-    let failure = try decodeFailure(GetRemindersTool().run(args: #"{"listName": "  "}"#))
-    XCTAssertEqual(failure.kind, "invalid_args")
+  func testCreateRejectsMissingOrEmptyTitle() throws {
+    for payload in [#"{}"#, #"{"title":"  "}"#] {
+      let result = try failure(CreateReminderTool().run(args: payload))
+      XCTAssertEqual(result.tool, "create_reminder")
+    }
   }
 
-  // MARK: - search_reminders
-
-  func testSearchRemindersRejectsEmptySearchText() throws {
-    // Regression: empty search text used to match every reminder.
-    let failure = try decodeFailure(SearchRemindersTool().run(args: #"{"searchText": ""}"#))
-    XCTAssertEqual(failure.kind, "invalid_args")
-    XCTAssertTrue(failure.message.contains("searchText"))
+  func testCreateRejectsLegacyNamesAndInvalidValues() throws {
+    let cases = [
+      (#"{"title":"Milk","listName":"Groceries"}"#, "listName"),
+      (#"{"title":"Milk","dueDate":"2026-08-06T17:00:00Z"}"#, "dueDate"),
+      (#"{"title":"Milk","due_at":"tomorrow"}"#, "due_at"),
+      (#"{"title":"Milk","priority":0}"#, "priority"),
+      (#"{"title":"Milk","priority":10}"#, "priority"),
+      (#"{"title":"Milk","notes":null}"#, "notes"),
+    ]
+    for (payload, field) in cases {
+      let result = try failure(CreateReminderTool().run(args: payload))
+      XCTAssertEqual(result.field, field)
+    }
   }
 
-  func testSearchRemindersRejectsWhitespaceSearchText() throws {
-    let failure = try decodeFailure(SearchRemindersTool().run(args: #"{"searchText": " \n "}"#))
-    XCTAssertEqual(failure.kind, "invalid_args")
-  }
-
-  func testSearchRemindersRejectsNegativeLimit() throws {
-    let failure = try decodeFailure(
-      SearchRemindersTool().run(args: #"{"searchText": "milk", "limit": -1}"#))
-    XCTAssertEqual(failure.kind, "invalid_args")
-    XCTAssertTrue(failure.message.contains("limit"))
-  }
-
-  // MARK: - create_reminder
-
-  func testCreateReminderRejectsEmptyTitle() throws {
-    let failure = try decodeFailure(CreateReminderTool().run(args: #"{"title": "  "}"#))
-    XCTAssertEqual(failure.kind, "invalid_args")
-    XCTAssertTrue(failure.message.contains("title"))
-  }
-
-  func testCreateReminderRejectsOutOfRangePriority() throws {
-    // Regression: priority was passed to EventKit unvalidated.
-    let failure = try decodeFailure(
-      CreateReminderTool().run(args: #"{"title": "Buy milk", "priority": 42}"#))
-    XCTAssertEqual(failure.kind, "invalid_args")
-    XCTAssertTrue(failure.message.contains("priority"))
-  }
-
-  func testCreateReminderRejectsInvalidDueDate() throws {
-    // Regression: invalid due dates were silently dropped.
-    let failure = try decodeFailure(
-      CreateReminderTool().run(args: #"{"title": "Buy milk", "dueDate": "tomorrow"}"#))
-    XCTAssertEqual(failure.kind, "invalid_args")
-    XCTAssertTrue(failure.message.contains("dueDate"))
-  }
-
-  // MARK: - search_reminders manifest documentation
-
-  func testSearchRemindersDescriptionDocumentsCompletedWindow() {
-    XCTAssertTrue(
-      SearchRemindersTool().description.contains("30 days"),
-      "Tool description must document the 30-day completed-reminder search window")
+  func testOpenRequiresNonemptyIDAndRejectsUnknownFields() throws {
+    for payload in [#"{}"#, #"{"id":""}"#, #"{"id":"abc","title":"Milk"}"#] {
+      let result = try failure(OpenReminderTool().run(args: payload))
+      XCTAssertEqual(result.tool, "open_reminder")
+    }
   }
 }
